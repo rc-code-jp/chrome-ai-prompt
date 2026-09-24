@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 let prompts = [];
 let editingId = null;
 let deleteTimer = 0;
+let busy = false;
 
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 $('save-key').textContent = isMac ? '⌘↵' : 'Ctrl↵';
@@ -31,10 +32,18 @@ async function init() {
     }
   });
 
+  // ポップアップとオプションページが同時に開いていても一覧を揃える
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes[STORAGE_KEY]) return;
     prompts = changes[STORAGE_KEY].newValue ?? [];
     renderList();
+    // 編集中のプロンプトが別の画面で削除されたら、入力内容は残したまま新規作成として扱う
+    if (editingId && !prompts.some((p) => p.id === editingId)) {
+      editingId = null;
+      $('edit-label').textContent = 'NEW PROMPT';
+      $('delete').hidden = true;
+      notify('このプロンプトは別の画面で削除されました。保存すると新しく作成されます。');
+    }
   });
 }
 
@@ -43,8 +52,26 @@ async function load() {
   return Array.isArray(stored) ? stored : [];
 }
 
-function persist() {
-  return chrome.storage.local.set({ [STORAGE_KEY]: prompts });
+// 保存・削除の共通処理。書き込みに成功してから画面を更新し、失敗したら入力内容を残したままエラーを出す。
+async function commit(next) {
+  if (busy) return; // 連打や Enter の押しっぱなしで二重に保存しない
+  busy = true;
+  notify('');
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEY]: next });
+    prompts = next;
+    closeEditor();
+    renderList();
+  } catch (error) {
+    notify(`保存できませんでした：${error?.message ?? error}`);
+  } finally {
+    busy = false;
+  }
+}
+
+function notify(message) {
+  $('notice').textContent = message;
+  $('notice').hidden = !message;
 }
 
 function renderList() {
@@ -90,6 +117,7 @@ function openEditor(id) {
   $('edit-label').textContent = prompt ? 'EDIT PROMPT' : 'NEW PROMPT';
   $('delete').hidden = !prompt;
   disarmDelete();
+  notify('');
   updateBodyCount();
   $('list-view').hidden = true;
   $('edit-view').hidden = false;
@@ -119,15 +147,10 @@ async function save() {
   }
   const title = $('title').value.trim() || body.trim().split('\n')[0].slice(0, 24);
   const now = Date.now();
-  const existing = prompts.find((p) => p.id === editingId);
-  if (existing) {
-    Object.assign(existing, { title, body, updatedAt: now });
-  } else {
-    prompts.unshift({ id: crypto.randomUUID(), title, body, createdAt: now, updatedAt: now });
-  }
-  await persist();
-  closeEditor();
-  renderList();
+  const next = prompts.some((p) => p.id === editingId)
+    ? prompts.map((p) => (p.id === editingId ? { ...p, title, body, updatedAt: now } : p))
+    : [{ id: crypto.randomUUID(), title, body, createdAt: now, updatedAt: now }, ...prompts];
+  await commit(next);
 }
 
 // 1 回目のクリックで確認状態にし、3 秒以内にもう一度押したら削除する
@@ -140,10 +163,7 @@ async function onDelete() {
     return;
   }
   disarmDelete();
-  prompts = prompts.filter((p) => p.id !== editingId);
-  await persist();
-  closeEditor();
-  renderList();
+  await commit(prompts.filter((p) => p.id !== editingId));
 }
 
 function disarmDelete() {

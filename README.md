@@ -34,6 +34,14 @@ Claude / Gemini（Gmail 内の Gemini 欄を含む）など、どのサイトの
 - 挿入は `document.execCommand('insertText')` で行います。ブラウザ本来の編集として扱われるため、
   React の制御コンポーネント、ProseMirror（Claude）、Quill 系エディタ（Gemini）の内部状態にも正しく反映されます。
 - 対象: `textarea`、`input`（type が text / search / url / tel）、`contenteditable`。パスワード欄などは対象外です。
+- ユーザーの実際の操作（`isTrusted` なイベント）にだけ反応します。ページのスクリプトが偽の `$$` 入力や Enter を
+  発生させて、保存済みプロンプトを自分の入力欄に挿入させて読み取る、という抜き取りを防ぐためです。
+
+## 既知の制限
+
+- ページが `<dialog>`（showModal）・Popover・フルスクリーンを表示しているあいだは、モーダルがその下に隠れることがあります（ブラウザの top layer の仕様）。
+- closed Shadow DOM の中にある入力欄では `$$` を検出できません。
+- `＄＄＄` のように 3 文字以上を一度に確定した場合、置き換わるのは末尾の 2 文字だけです。
 
 ## 構成
 

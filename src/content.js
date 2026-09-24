@@ -23,20 +23,24 @@
    */
   /** @type {Session | null} */
   let session = null;
+  // 自分の execCommand が発火させる input で再トリガーしないためのフラグ（本文が $$ で終わる場合など）
+  let replacing = false;
 
   // ---------------------------------------------------------------------------
   // トリガー検出
   // ---------------------------------------------------------------------------
 
+  // isTrusted: ページのスクリプトが偽の $$ 入力や Enter を dispatch して、
+  // プロンプトを自分の入力欄に挿入させて読み取る（抜き取る）のを防ぐ。
   addEventListener('input', (e) => {
-    if (session || e.isComposing || !e.data || !TRIGGER_CHAR.test(e.data)) return;
+    if (!e.isTrusted || session || replacing || e.isComposing || !e.data || !TRIGGER_CHAR.test(e.data)) return;
     if (e.inputType !== 'insertText' && e.inputType !== 'insertCompositionText') return;
     open(e.composedPath()[0]);
   }, true);
 
   // IME 確定（全角＄＄）は compositionend で判定する。エディタが DOM を確定させるのを 1 tick 待つ。
   addEventListener('compositionend', (e) => {
-    if (session || !e.data || !TRIGGER_CHAR.test(e.data)) return;
+    if (!e.isTrusted || session || replacing || !e.data || !TRIGGER_CHAR.test(e.data)) return;
     const origin = e.composedPath()[0];
     setTimeout(() => {
       if (!session) open(origin);
@@ -83,10 +87,18 @@
     if (node.nodeType === Node.TEXT_NODE && offset >= TRIGGER_LEN) {
       return node.data.slice(offset - TRIGGER_LEN, offset);
     }
+    // キャレットが要素境界にある場合。$$ は同じ段落内にあるはずなので、
+    // 文書全体ではなくキャレットを含むブロック要素の範囲だけを文字列化する。
     const range = document.createRange();
-    range.selectNodeContents(el);
+    range.selectNodeContents(closestBlock(node, el));
     range.setEnd(node, offset);
     return range.toString().slice(-TRIGGER_LEN);
+  }
+
+  function closestBlock(node, root) {
+    const start = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    const block = start?.closest('p, div, li, pre, blockquote, td, th, h1, h2, h3, h4, h5, h6');
+    return block && root.contains(block) ? block : root;
   }
 
   async function open(origin) {
@@ -96,23 +108,43 @@
     if (caret === null || !TRIGGER_TAIL.test(textBefore(target, caret))) return;
     if (!chrome.runtime?.id) return; // 拡張の再読み込み後に取り残されたスクリプト
 
+    // session があるあいだはページへのキー入力を止めるので、どこで失敗しても必ず session を解除する
     const current = (session = { target, caret, prompts: [], index: 0, ui: null });
-    const prompts = await loadPrompts();
-    if (session !== current) return;
-    if (!prompts) {
-      session = null;
-      return;
+    try {
+      const prompts = await loadPrompts();
+      if (session !== current) return;
+      if (!prompts) {
+        session = null;
+        return;
+      }
+      current.prompts = prompts;
+      current.ui = mountUI(current);
+    } catch (error) {
+      if (session === current) session = null;
+      console.warn('[Prompt Spark] モーダルを開けませんでした', error);
     }
-    current.prompts = prompts;
-    current.ui = mountUI(current);
   }
 
+  const LOAD_TIMEOUT_MS = 1500;
+
+  /** 読み込めなかったとき（拡張の再読み込み・タイムアウト）は null。壊れたデータは除外する。 */
   async function loadPrompts() {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(resolve, LOAD_TIMEOUT_MS, null);
+    });
     try {
-      const { prompts } = await chrome.storage.local.get('prompts');
-      return Array.isArray(prompts) ? prompts : [];
+      const result = await Promise.race([chrome.storage.local.get('prompts'), timeout]);
+      if (!result) return null;
+      const { prompts } = result;
+      if (!Array.isArray(prompts)) return [];
+      return prompts
+        .filter((p) => p && typeof p.body === 'string')
+        .map((p) => ({ id: String(p.id), title: typeof p.title === 'string' ? p.title : '', body: p.body }));
     } catch {
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -121,7 +153,7 @@
   // ---------------------------------------------------------------------------
 
   addEventListener('keydown', (e) => {
-    if (!session) return;
+    if (!session || !e.isTrusted) return;
     e.stopImmediatePropagation();
     if (e.isComposing || e.keyCode === 229) return;
     switch (e.key) {
@@ -214,9 +246,14 @@
     const live = target.el.isConnected ? target : resolveTarget(deepActiveElement());
     if (!live) return;
     const { kind, el } = live;
-    el.focus({ preventScroll: true });
-    if (kind === 'field') replaceInField(el, caret, text);
-    else replaceInRich(el, caret, text);
+    replacing = true;
+    try {
+      el.focus({ preventScroll: true });
+      if (kind === 'field') replaceInField(el, caret, text);
+      else replaceInRich(el, caret, text);
+    } finally {
+      replacing = false;
+    }
   }
 
   function fieldHasTrigger(el, pos) {
@@ -228,7 +265,8 @@
     if (end !== undefined) {
       editField(el, end - TRIGGER_LEN, end, text);
     } else if (text) {
-      editField(el, el.selectionStart, el.selectionEnd, text);
+      // $$ が見つからないときは選択範囲を上書きせず、選択の末尾に挿入する
+      editField(el, el.selectionEnd, el.selectionEnd, text);
     }
   }
 
@@ -253,8 +291,11 @@
     const found = [caret, current].some((range) => range && selectTrigger(sel, el, range));
     if (!found) {
       if (!text) return;
+      // $$ が見つからないときは選択範囲を上書きせず、キャレット位置（なければ選択の末尾）に挿入する
       const fallback = [current, caret].find((range) => range && el.contains(range.startContainer));
       if (fallback) sel.collapse(fallback.startContainer, fallback.startOffset);
+      else if (sel.rangeCount && el.contains(sel.focusNode)) sel.collapseToEnd();
+      else return;
     }
     const ok = text ? document.execCommand('insertText', false, text) : document.execCommand('delete');
     if (!ok && text) pasteText(el, text);
@@ -321,7 +362,16 @@
 
   function mountUI(s) {
     const host = document.createElement('prompt-spark-root');
-    host.style.cssText = 'all: initial; position: fixed; inset: 0; z-index: 2147483647;';
+    // ページ側の !important（:not(:defined) { display: none !important } など）に負けないよう inline で固定する。
+    // all は direction を含まないので、RTL のページでも反転しないよう別途指定する。
+    host.style.cssText = [
+      'all: initial',
+      'display: block',
+      'position: fixed',
+      'inset: 0',
+      'z-index: 2147483647',
+      'direction: ltr',
+    ].map((declaration) => `${declaration} !important;`).join(' ');
     const root = host.attachShadow({ mode: 'closed' });
     adoptStyles(root);
 
@@ -335,6 +385,8 @@
     const list = h('div', { class: 'list', role: 'listbox', 'aria-label': '保存したプロンプト' }, ...items);
     const previewText = h('div', { class: 'preview-text' });
     const count = h('span', { class: 'count' });
+    // フォーカスは入力欄に残るため、選択中のプロンプトはライブリージョンでスクリーンリーダーに伝える
+    const live = h('div', { class: 'sr-only', 'aria-live': 'polite' });
 
     const body = hasPrompts
       ? h('div', { class: 'body' },
@@ -353,6 +405,7 @@
     const wrap = h('div', { class: 'wrap' },
       h('div', { class: 'backdrop' }),
       h('section', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'プロンプトを挿入' },
+        live,
         h('div', { class: 'ring' }),
         h('div', { class: 'surface' },
           h('header', { class: 'head' },
@@ -401,18 +454,30 @@
       previewText.classList.add('reveal');
       count.textContent = `${[...prompt.body].length.toLocaleString()} 文字`;
       keepVisible(list, items[s.index]);
+      announce();
+    }
+
+    function announce() {
+      const prompt = s.prompts[s.index];
+      live.textContent = prompt
+        ? `${prompt.title || '無題のプロンプト'}（${s.index + 1} / ${s.prompts.length}）。Enter で挿入、Esc で閉じる`
+        : 'まだプロンプトがありません。Enter で登録画面を開く、Esc で閉じる';
     }
 
     function unmount() {
-      wrap.classList.remove('open');
       wrap.classList.add('closing');
       setTimeout(() => host.remove(), 160);
     }
 
     root.append(wrap);
     document.documentElement.append(host);
-    render();
-    requestAnimationFrame(() => wrap.classList.add('open'));
+    try {
+      render();
+    } catch (error) {
+      host.remove();
+      throw error;
+    }
+    setTimeout(announce, 100); // 挿入直後の変更は読み上げられないことがあるので、表示後にもう一度
     return { render, unmount };
   }
 
@@ -431,7 +496,7 @@
 .wrap {
   --text: #eceefe;
   --muted: #979dc4;
-  --faint: #636a92;
+  --faint: #7f87b0;
   --line: rgba(196, 200, 255, 0.09);
   --violet: #8b5cf6;
   --indigo: #6366f1;
@@ -447,6 +512,9 @@
   font: 13px/1.5 "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic UI", sans-serif;
   -webkit-font-smoothing: antialiased;
   text-align: left;
+  direction: ltr;
+  unicode-bidi: isolate;
+  user-select: none;
 }
 
 .backdrop {
@@ -456,8 +524,7 @@
     radial-gradient(900px 520px at 50% 45%, rgba(99, 102, 241, 0.20), transparent 65%),
     rgba(5, 6, 16, 0.55);
   backdrop-filter: blur(6px) saturate(125%);
-  opacity: 0;
-  transition: opacity 0.2s ease;
+  animation: fade-in 0.2s ease both;
 }
 
 .modal {
@@ -474,14 +541,15 @@
     0 30px 80px -24px rgba(0, 0, 0, 0.75),
     0 0 70px -14px rgba(139, 92, 246, 0.5),
     0 0 140px -40px rgba(34, 211, 238, 0.45);
-  opacity: 0;
-  transform: translateY(12px) scale(0.97);
-  transition: opacity 0.22s ease, transform 0.32s cubic-bezier(0.2, 0.9, 0.25, 1.12);
+  animation: modal-in 0.32s cubic-bezier(0.2, 0.9, 0.25, 1.12) both;
 }
-.open .backdrop, .open .modal { opacity: 1; }
-.open .modal { transform: none; }
-.closing .backdrop, .closing .modal { transition-duration: 0.14s; }
-.closing .modal { transform: translateY(6px) scale(0.985); }
+/* JS の requestAnimationFrame に頼らず CSS だけで表示する（描画が止まっているフレームでも透明のまま残らない） */
+.closing .backdrop { animation: fade-out 0.14s ease both; }
+.closing .modal { animation: modal-out 0.14s ease both; }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes fade-out { to { opacity: 0; } }
+@keyframes modal-in { from { opacity: 0; transform: translateY(12px) scale(0.97); } }
+@keyframes modal-out { to { opacity: 0; transform: translateY(6px) scale(0.985); } }
 
 /* 回転するグラデーションの縁取り */
 .ring {
@@ -525,6 +593,7 @@
 
 .head {
   position: relative;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -572,6 +641,7 @@
   min-height: 0;
   padding: 0 20px 16px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .list {
@@ -582,6 +652,7 @@
   margin: -2px;
   padding: 2px;
   overflow: auto;
+  overscroll-behavior: contain;
   scrollbar-width: thin;
 }
 .item {
@@ -658,6 +729,7 @@
   max-height: 220px;
   padding: 8px 14px 14px;
   overflow: auto;
+  overscroll-behavior: contain;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.7;
@@ -698,6 +770,7 @@
 
 .foot {
   position: relative;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -768,6 +841,16 @@ kbd {
   background: rgba(255, 255, 255, 0.18);
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 @media (max-width: 460px) {
   .head { padding: 16px 16px 12px; }
   .body { padding: 0 16px 14px; }
@@ -776,7 +859,7 @@ kbd {
 }
 @media (prefers-reduced-motion: reduce) {
   .ring, .logo svg, .orb, .primary::after, .preview-text.reveal { animation: none; }
-  .modal, .backdrop { transition-duration: 0.01s; }
+  .modal, .backdrop { animation-duration: 0.01s !important; }
 }
 `;
 })();
